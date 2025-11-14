@@ -109,7 +109,11 @@ class CarState(CarStateBase, MadsCarState):
 
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else cp_cam.vl["IPMA_Data2"]["IsaVLimUnit_D_Rq"] == 1
-    ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"] * (CV.KPH_TO_MS if is_metric else CV.MPH_TO_MS)
+
+    # Use Veh_V_RqCcSet for ICBM - it's the requested setpoint and updates immediately when buttons are pressed
+    # Veh_V_DsplyCcSet is a display value with lag, causing ICBM to spam buttons
+    cruise_speed_kph = cp.vl["EngVehicleSpThrottle2"]["Veh_V_RqCcSet"]
+    ret.cruiseState.speed = cruise_speed_kph * CV.KPH_TO_MS
     ret.cruiseState.speedCluster = ret.cruiseState.speed  # ICBM needs speedCluster to read current cruise setpoint
     ret.cruiseState.enabled = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (4, 5)
     ret.cruiseState.available = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (3, 4, 5)
