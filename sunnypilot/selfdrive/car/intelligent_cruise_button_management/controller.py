@@ -18,6 +18,7 @@ SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
 ALLOWED_SPEED_THRESHOLD = 1.8  # m/s, ~4 MPH
 HYST_GAP = 0.0  # currently disabled; TODO-SP: might need to be brand-specific
 INACTIVE_TIMER = 0.4
+MANUAL_OVERRIDE_GRACE_PERIOD = 3.0  # seconds to wait after manual button press before ICBM reactivates
 
 
 SEND_BUTTONS = {
@@ -44,6 +45,8 @@ class IntelligentCruiseButtonManagement:
     self.is_metric = False
 
     self.cruise_button_timers = CRUISE_BUTTON_TIMER
+    self.manual_override_timer = 0  # Timer for grace period after manual button press
+    self.button_pressed_prev = False  # Track previous button state to detect release
 
   @property
   def v_cruise_equal(self) -> bool:
@@ -111,7 +114,19 @@ class IntelligentCruiseButtonManagement:
     ready = CC.enabled and not CC.cruiseControl.override and not CC.cruiseControl.cancel and not CC.cruiseControl.resume
     button_pressed = any(self.cruise_button_timers[k] > 0 for k in self.cruise_button_timers)
 
-    self.is_ready = ready and not button_pressed
+    # Detect button release and start grace period
+    if self.button_pressed_prev and not button_pressed:
+      # Button was just released, start grace period timer
+      self.manual_override_timer = int(MANUAL_OVERRIDE_GRACE_PERIOD / DT_CTRL)
+
+    # Decrement grace period timer
+    if self.manual_override_timer > 0:
+      self.manual_override_timer -= 1
+
+    # ICBM is ready only if: enabled, no override/cancel/resume, no buttons pressed, and grace period expired
+    self.is_ready = ready and not button_pressed and self.manual_override_timer == 0
+
+    self.button_pressed_prev = button_pressed
 
   def run(self, CS: car.CarState, CC: car.CarControl, LP_SP: custom.LongitudinalPlanSP, is_metric: bool) -> None:
     if self.CP_SP.pcmCruiseSpeed:
