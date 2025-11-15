@@ -195,7 +195,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     # max absolute values for all four signals
     self.path_angle_max = 0.5  # from dbc files
     self.path_offset_max = 2.0  # too much path offset causes issues
-    self.curvature_max = 0.02  # from dbc files
+    self.curvature_max = 0.0115  # 0.02 is max from dbc files, but more than 0.012 can cause windup in big curves
     self.curvature_rate_max = 0.001023  # from dbc files
 
     # values from previous frame
@@ -597,14 +597,6 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
         # sum path_angle_low_c and path_angle_high_c
         path_angle = path_angle_low_c + path_angle_high_c
 
-        # zero path_angle during lane changes
-        if self.lane_change:
-          path_angle = 0.0
-
-        # reset path angle if steering reset is active
-        if reset_steering == 1:
-          path_angle = 0.0
-
         # Apply post lane change transition logic
         path_angle, path_offset, desired_curvature_rate = self.handle_post_lane_change_transition(
             path_angle, path_offset, desired_curvature_rate
@@ -640,9 +632,9 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
 
         # reset steering by setting all values to 0 and ramp_type to immediate
         if reset_steering == 1:
-          apply_curvature = 0
+          # apply_curvature = 0 reset is done above before rate limiting
           path_offset = 0
-          path_angle = 0
+          # path_angle = 0 reset is done above before rate limiting
           desired_curvature_rate = 0
           ramp_type = 3
           self.path_angle_deque.clear()
@@ -788,13 +780,6 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.steer_alert_last = steer_alert
     self.fcw_alert_last = fcw_alert
     self.lead_distance_bars_last = hud_control.leadDistanceBars
-
-
-
-    # ICBM: Intelligent Cruise Button Management
-    can_sends.extend(IntelligentCruiseButtonManagementInterface.update(
-      self, CS, CC_SP, self.packer, self.frame, self.last_button_frame, self.CAN
-    ))
 
     new_actuators = actuators.as_builder()
     new_actuators.torqueOutputCan = float(self.steer_warning)
