@@ -110,13 +110,22 @@ class CarState(CarStateBase, MadsCarState):
     # cruise state
     is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else cp_cam.vl["IPMA_Data2"]["IsaVLimUnit_D_Rq"] == 1
 
+    # Read cruise state first to check if cruise is active
+    cruise_status = cp.vl["EngBrakeData"]["CcStat_D_Actl"]
+    ret.cruiseState.enabled = cruise_status in (4, 5)  # Active or Active_Que_Assist
+    ret.cruiseState.available = cruise_status in (3, 4, 5)  # Standby, Active, or Active_Que_Assist
+
     # Use Veh_V_RqCcSet for ICBM - it's the requested setpoint and updates immediately when buttons are pressed
     # Veh_V_DsplyCcSet is a display value with lag, causing ICBM to spam buttons
-    cruise_speed_kph = cp.vl["EngVehicleSpThrottle2"]["Veh_V_RqCcSet"]
-    ret.cruiseState.speed = cruise_speed_kph * CV.KPH_TO_MS
+    # IMPORTANT: Only use Veh_V_RqCcSet when cruise is enabled, otherwise it may contain stale values
+    if ret.cruiseState.enabled:
+      cruise_speed_kph = cp.vl["EngVehicleSpThrottle2"]["Veh_V_RqCcSet"]
+      ret.cruiseState.speed = cruise_speed_kph * CV.KPH_TO_MS
+    else:
+      # When cruise is not enabled, use 0 or current vehicle speed to avoid stale setpoints
+      ret.cruiseState.speed = 0.0
+
     ret.cruiseState.speedCluster = ret.cruiseState.speed  # ICBM needs speedCluster to read current cruise setpoint
-    ret.cruiseState.enabled = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (4, 5)
-    ret.cruiseState.available = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (3, 4, 5)
     ret.cruiseState.nonAdaptive = cp.vl["Cluster_Info1_FD1"]["AccEnbl_B_RqDrv"] == 0
     ret.cruiseState.standstill = cp.vl["EngBrakeData"]["AccStopMde_D_Rq"] == 3
     ret.accFaulted = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (1, 2)
