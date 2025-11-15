@@ -82,13 +82,10 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
     cloudlog.warning("ICBM not available or openpilot Longitudinal Control enabled, cleaning up params")
     params.remove("IntelligentCruiseButtonManagement")
 
-  # Disable features that require openpilot longitudinal control or conflict with ICBM
-  if not CP.openpilotLongitudinalControl:
-    cloudlog.warning("openpilot Longitudinal Control not available, cleaning up incompatible params")
+  if not CP.openpilotLongitudinalControl and CP_SP.pcmCruiseSpeed:
+    cloudlog.warning("openpilot Longitudinal Control and ICBM not available, cleaning up params")
     params.remove("DynamicExperimentalControl")
     params.remove("CustomAccIncrementsEnabled")
-    # SmartCruiseControl conflicts with ICBM - both try to control cruise speed
-    # With ICBM, the cruise setpoint is user's intent; SCC would fight user/ICBM changes
     params.remove("SmartCruiseControlVision")
     params.remove("SmartCruiseControlMap")
 
