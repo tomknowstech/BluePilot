@@ -222,9 +222,16 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.max_path_offset_change = 0.00125
     self.max_curvature_rate_change = 0.0001
 
-    self.sm = messaging.SubMaster(['modelV2', 'liveParameters', 'selfdriveState'])
+    self.sm = messaging.SubMaster(['modelV2', 'liveParameters', 'selfdriveState', 'longitudinalPlanSP'])
     self.VM = VehicleModel(self.CP)
     self.curvature_lookup_time = 0.2
+
+    # ICBM desired cruise speed tracking (Ford-specific fix for SCC-Vision + Speed Limit interaction)
+    self.icbm_desired_v_cruise_kph = 0.0  # Desired cruise speed in kph (speed limit + offset, or user-set)
+    self.icbm_desired_v_cruise_initialized = False
+    self.icbm_last_speed_limit_kph = 0.0  # Track speed limit changes
+    self.icbm_manual_override_detected = False
+    self.icbm_last_v_cruise_cluster_kph = 0.0
 
     self.model = None
     self.lp = None
@@ -295,6 +302,130 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
 
     return (path_angle, path_offset, desired_curvature_rate)
 
+  def update_icbm_desired_cruise_speed(self, CS, CC, CC_SP):
+    """
+    Ford-specific ICBM enhancement to track desired cruise speed.
+
+    This solves the issue where SCC-Vision slows for curves and ICBM lowers the cruise setpoint,
+    but after the curve, the setpoint stays low because SLA goes inactive when the cluster changes.
+
+    We track a "desired" cruise speed (speed limit + offset or user-set) and restore it after curves.
+    """
+    from openpilot.common.constants import CV
+
+    # Only run if ICBM is available
+    if not self.CP_SP.intelligentCruiseButtonManagementAvailable:
+      return
+
+    # Get current cruise cluster speed
+    v_cruise_cluster_kph = CS.cruiseState.speedCluster * CV.MS_TO_KPH
+
+    # Get longitudinal plan data if available
+    if not self.sm.updated['longitudinalPlanSP']:
+      return
+
+    lp_sp = self.sm['longitudinalPlanSP']
+
+    # Get speed limit data
+    speed_limit_ms = lp_sp.speedLimit.resolver.speedLimitFinalLast if lp_sp.speedLimit.resolver.speedLimitLastValid else 0.0
+    speed_limit_kph = speed_limit_ms * CV.MS_TO_KPH
+    sla_active = lp_sp.speedLimit.assist.active
+    sla_enabled = lp_sp.speedLimit.assist.enabled
+
+    # Get SCC-Vision state
+    scc_vision_active = lp_sp.smartCruiseControl.vision.active
+
+    # Detect manual cruise button presses (user changing setpoint)
+    # Check if cruise cluster changed but ICBM isn't pressing buttons (meaning user pressed them)
+    icbm_send_button = getattr(CC_SP.intelligentCruiseButtonManagement, 'sendButton', 0)
+    cluster_changed_by_user = (
+      abs(v_cruise_cluster_kph - self.icbm_last_v_cruise_cluster_kph) > 0.5 and
+      icbm_send_button == 0  # ICBM not pressing buttons (SendButtonState.none = 0)
+    )
+
+    if cluster_changed_by_user:
+      self.icbm_manual_override_detected = True
+
+    # Initialize desired cruise speed on first run or when ICBM first activates
+    if not self.icbm_desired_v_cruise_initialized and CC.enabled:
+      if speed_limit_kph > 0:
+        # Use speed limit + offset if available
+        self.icbm_desired_v_cruise_kph = speed_limit_kph
+      else:
+        # Otherwise use current cruise setpoint
+        self.icbm_desired_v_cruise_kph = v_cruise_cluster_kph
+      self.icbm_desired_v_cruise_initialized = True
+      self.icbm_last_speed_limit_kph = speed_limit_kph
+
+    # Update desired cruise speed based on conditions
+    if self.icbm_desired_v_cruise_initialized:
+      # 1. If speed limit changes, update desired cruise speed
+      if abs(speed_limit_kph - self.icbm_last_speed_limit_kph) > 0.5 and speed_limit_kph > 0:
+        self.icbm_desired_v_cruise_kph = speed_limit_kph
+        self.icbm_last_speed_limit_kph = speed_limit_kph
+        self.icbm_manual_override_detected = False  # New speed limit, clear manual override
+
+      # 2. If user manually changed setpoint (and manual override grace period expired), update desired
+      if self.icbm_manual_override_detected and cluster_changed_by_user:
+        self.icbm_desired_v_cruise_kph = v_cruise_cluster_kph
+        self.icbm_manual_override_detected = False  # Accept the manual change
+
+      # 3. If SLA is active, use its target as desired (it has the speed limit logic)
+      if sla_active or sla_enabled:
+        sla_v_target_kph = lp_sp.speedLimit.assist.vTarget * CV.MS_TO_KPH
+        if sla_v_target_kph > 0 and sla_v_target_kph < 255:  # Valid target (not V_CRUISE_UNSET)
+          self.icbm_desired_v_cruise_kph = sla_v_target_kph
+
+    # Reset on disengage
+    if not CC.enabled:
+      self.icbm_desired_v_cruise_initialized = False
+      self.icbm_manual_override_detected = False
+
+    # Store current cluster speed for next iteration
+    self.icbm_last_v_cruise_cluster_kph = v_cruise_cluster_kph
+
+  def apply_icbm_desired_speed_override(self, CC_SP, CS):
+    """
+    Override ICBM button commands to restore desired cruise speed when appropriate.
+
+    This is called before sending ICBM button commands. If SCC-Vision is inactive (no curve)
+    and the current cruise setpoint is below the desired speed, we override ICBM to press
+    the increase button to restore the desired speed.
+    """
+    from openpilot.common.constants import CV
+    from opendbc.car.structs import IntelligentCruiseButtonManagement
+
+    # Only apply if we have a valid desired speed
+    if not self.icbm_desired_v_cruise_initialized:
+      return CC_SP
+
+    # Get longitudinal plan data
+    if not self.sm.updated['longitudinalPlanSP']:
+      return CC_SP
+
+    lp_sp = self.sm['longitudinalPlanSP']
+
+    # Get SCC-Vision state
+    scc_vision_active = lp_sp.smartCruiseControl.vision.active
+
+    # Only override if SCC-Vision is NOT active (not in a curve)
+    if scc_vision_active:
+      return CC_SP
+
+    # Get current cruise cluster speed
+    v_cruise_cluster_kph = CS.cruiseState.speedCluster * CV.MS_TO_KPH
+
+    # If current cruise is below desired by more than 1 kph, override to increase
+    if v_cruise_cluster_kph < (self.icbm_desired_v_cruise_kph - 1.0):
+      # Override ICBM to press increase button
+      CC_SP.intelligentCruiseButtonManagement.sendButton = 1  # SendButtonState.increase
+    # If current cruise is above desired by more than 1 kph, override to decrease
+    elif v_cruise_cluster_kph > (self.icbm_desired_v_cruise_kph + 1.0):
+      # Override ICBM to press decrease button
+      CC_SP.intelligentCruiseButtonManagement.sendButton = 2  # SendButtonState.decrease
+
+    return CC_SP
+
   def update(self, CC, CC_SP, CS, now_nanos):
     can_sends = []
     self.sm.update(0)
@@ -354,6 +485,10 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       can_sends.append(fordcan.create_button_msg(self.packer, self.CAN.camera, CS.buttons_stock_values, tja_toggle=True))
 
     # Intelligent Cruise Button Management (ICBM)
+    # Ford-specific: Track desired cruise speed and restore after curves
+    self.update_icbm_desired_cruise_speed(CS, CC, CC_SP)
+    CC_SP = self.apply_icbm_desired_speed_override(CC_SP, CS)
+
     icbm_can_sends, self.last_button_frame = IntelligentCruiseButtonManagementInterface.update(
       self, CC_SP, CS, self.packer, self.CAN, self.frame, self.last_button_frame
     )
